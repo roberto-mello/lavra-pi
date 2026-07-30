@@ -248,7 +248,7 @@ function insertEntry(dbPath: string, entry: KnowledgeEntry): void {
         `--arg tags_text ${JSON.stringify(tagsText)} --argjson ts ${entry.ts} ` +
         `--arg bead ${JSON.stringify(entry.bead)} '[$key, $type, $content, $source, $tags_text, $ts, $bead] | @csv'`,
       { encoding: "utf-8", timeout: 5000 },
-    ).toString()).trim();
+    ).toString().trim();
     fs.writeFileSync(tmpFile, csvLine + "\n", "utf-8");
     execSync(`sqlite3 "${dbPath}" ".mode csv" ".import '${tmpFile}' knowledge"`, {
       stdio: "ignore",
@@ -287,7 +287,7 @@ function syncKnowledge(projectRoot: string): void {
       const comments = execSync(
         `bd sql --json "SELECT issue_id, text FROM comments WHERE text LIKE 'LEARNED:%' OR text LIKE 'DECISION:%' OR text LIKE 'FACT:%' OR text LIKE 'PATTERN:%' OR text LIKE 'INVESTIGATION:%'"`,
         { encoding: "utf-8", timeout: 15000 },
-      ).toString()).trim();
+      ).toString().trim();
       if (comments && comments !== "[]") {
         const rows = JSON.parse(comments);
         for (const row of rows) {
