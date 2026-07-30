@@ -11,18 +11,17 @@ pi install git:github.com/roberto-mello/lavra-pi
 
 **One command. Zero bootstrap. Everything auto-loads.**
 
-The bridge extension resolves agents, hooks, and skills from
-`@lavralabs/lavra` (the same npm package you already publish to
-`npmjs.com`). When pi runs `npm install` during the git install,
-it pulls `@lavralabs/lavra` into `node_modules/`. The extension
-discovers agents from there at startup.
+The bridge extension resolves agents from `@lavralabs/lavra` (the same npm
+package you already publish on `npmjs.com`). When pi runs `npm install`
+during the git install, it pulls `@lavralabs/lavra` into `node_modules/`.
+The extension discovers agents from there at startup.
 
 ## What You Get
 
 | Feature | How It Works |
 |---|---|
 | **30 agents** (review, research, design, workflow, docs) | Loaded from `node_modules/@lavralabs/lavra/plugins/lavra/agents/` |
-| **15+ skills** | Discovered by pi from same path via `pi.skills` in `package.json` |
+| **15+ skills** (SKILL.md) | Agents discover them at runtime by globbing `**/**/SKILL.md` during research — not pre-loaded by pi |
 | **~17 commands** (`/lavra-work`, `/lavra-design`, etc.) | `pi.registerCommand()` — registered at startup |
 | **Auto-recall** (session start knowledge injection) | `session_start` event handler reads knowledge.jsonl + session state |
 | **Memory capture** (post-tool knowledge extraction) | `tool_result` event intercepts `bd comments add` |
@@ -33,11 +32,19 @@ discovers agents from there at startup.
 | **Subagent wrapup** (log learnings before exit) | Built into subagent tool — prompts `LEARNED:`/`DECISION:` comments |
 | **Model routing per agent** | Agent `model:` frontmatter → `--model` flag to subagent pi process |
 
+### Skill Conflicts
+
+Skills bundled in `@lavralabs/lavra` are **not registered with pi**, so there
+are no collisions with skills you already have installed
+(agent-browser, frontend-design, brainstorming, etc.). Lavra's research agents
+discover and read skills directly from the filesystem during research,
+independent of pi's skill loading.
+
 ## Architecture
 
 ```
 lavra-pi/
-├── package.json              # pi package: declares extension + skill paths
+├── package.json              # pi package — declares extension only
 ├── src/
 │   └── bridge.ts             # The whole runtime (~900 lines)
 └── node_modules/
@@ -45,8 +52,8 @@ lavra-pi/
         └── lavra/            # Resolved at npm install time
             └── plugins/lavra/
                 ├── agents/   # 30 .md agent definitions
-                ├── skills/   # 15+ skill directories
-                └── hooks/    # Bash scripts (referenced but not required at runtime)
+                ├── skills/   # Not loaded by pi — agents discover at runtime
+                └── hooks/    # Available for pi.exec() but not required
 ```
 
 ### No vendoring
