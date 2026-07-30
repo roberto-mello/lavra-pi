@@ -1,0 +1,33 @@
+{
+  "name": "lavra-pi",
+  "version": "0.7.7",
+  "description": "Lavra for pi: beads-based persistent memory, 30 specialized agents, multi-agent workflows",
+  "keywords": ["pi-package", "lavra", "beads", "memory", "multi-agent", "knowledge-management"],
+  "license": "MIT",
+  "author": {
+    "name": "Roberto Mello",
+    "email": "roberto.mello@gmail.com"
+  },
+  "repository": "https://github.com/roberto-mello/lavra-pi",
+  "homepage": "https://lavra.dev",
+  "pi": {
+    "extensions": ["./src/bridge.ts"],
+    "skills": [
+      "./node_modules/@lavralabs/lavra/plugins/lavra/skills",
+      "./node_modules/@lavralabs/lavra/plugins/lavra/skills/optional"
+    ]
+  },
+  "dependencies": {
+    "@lavralabs/lavra": "^0.7.6"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
