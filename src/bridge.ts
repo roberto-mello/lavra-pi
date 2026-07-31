@@ -692,6 +692,23 @@ export default function (pi: ExtensionAPI) {
     return isLavraProject(cwd);
   }
 
+  /** Read a command .md or skill SKILL.md from @lavralabs/lavra, inject args, send to model */
+  function sendCommandFile(name: string, args: string, ctx: ExtensionContext): void {
+    // Try command file first, then skill file
+    const cmdFile = path.join(lavraPluginsPath(), "commands", `${name}.md`);
+    const skillFile = path.join(lavraPluginsPath(), "skills", name, "SKILL.md");
+    const file = fs.existsSync(cmdFile) ? cmdFile
+      : fs.existsSync(skillFile) ? skillFile
+      : null;
+    if (!file) {
+      ctx.ui.notify(`No command or skill found for "${name}"`, "error");
+      return;
+    }
+    let content = fs.readFileSync(file, "utf-8");
+    content = content.replace(/\$ARGUMENTS|#\$ARGUMENTS/g, args || "");
+    pi.sendUserMessage(content, { deliverAs: "nextTurn" });
+  }
+
   const commands: Array<{
     name: string;
     description: string;
@@ -701,66 +718,63 @@ export default function (pi: ExtensionAPI) {
       name: "lavra-work",
       description: "Execute work on one or many beads — auto-routes single/sequential/parallel",
       handler: async (args, ctx) => {
-        ctx.ui.notify(
-          `Lavra Work: ${args || "all ready beads"} — use \`lavra_subagent\` tool for execution`,
-          "info",
-        );
+        sendCommandFile("lavra-work", args, ctx);
       },
     },
     {
       name: "lavra-design",
       description: "Full design pipeline: brainstorm, plan, research, revise, review, lock",
-      handler: async (_args, ctx) => {
-        ctx.ui.notify("Lavra Design: multi-phase pipeline — planning...", "info");
+      handler: async (args, ctx) => {
+        sendCommandFile("lavra-design", args, ctx);
       },
     },
     {
       name: "lavra-research",
       description: "Gather evidence and best practices using domain-matched research agents",
-      handler: async (_args, ctx) => {
-        ctx.ui.notify("Lavra Research: dispatching research agents...", "info");
+      handler: async (args, ctx) => {
+        sendCommandFile("lavra-research", args, ctx);
       },
     },
     {
       name: "lavra-review",
       description: "Exhaustive code review using multi-agent analysis (4+ review agents)",
-      handler: async (_args, ctx) => {
-        ctx.ui.notify("Lavra Review: launching review agents...", "info");
+      handler: async (args, ctx) => {
+        sendCommandFile("lavra-review", args, ctx);
       },
     },
     {
       name: "lavra-plan",
       description: "Create detailed implementation plan from an epic/story bead",
-      handler: async (_args, ctx) => {
-        ctx.ui.notify("Lavra Plan: generating implementation plan...", "info");
+      handler: async (args, ctx) => {
+        sendCommandFile("lavra-plan", args, ctx);
       },
     },
     {
       name: "lavra-brainstorm",
       description: "Interactive brainstorming with structured output",
-      handler: async (_args, ctx) => {
-        ctx.ui.notify("Lavra Brainstorm: starting interactive session...", "info");
+      handler: async (args, ctx) => {
+        sendCommandFile("lavra-brainstorm", args, ctx);
       },
     },
     {
       name: "lavra-qa",
       description: "Browser-based QA verification (uses agent-browser)",
-      handler: async (_args, ctx) => {
-        ctx.ui.notify("Lavra QA: launching browser tests...", "info");
+      handler: async (args, ctx) => {
+        sendCommandFile("lavra-qa", args, ctx);
       },
     },
     {
       name: "lavra-checkpoint",
       description: "Save session progress: file beads, capture knowledge, sync state",
-      handler: async (_args, ctx) => {
-        ctx.ui.notify("Lavra Checkpoint: saving progress...", "info");
+      handler: async (args, ctx) => {
+        sendCommandFile("lavra-checkpoint", args, ctx);
       },
     },
     {
       name: "lavra-quick",
       description: "Quick task without full Lavra workflow overhead",
-      handler: async (_args, ctx) => {
-        ctx.ui.notify("Lavra Quick: executing lightweight task...", "info");
+      handler: async (args, ctx) => {
+        sendCommandFile("lavra-quick", args, ctx);
       },
     },
     {
@@ -814,17 +828,36 @@ export default function (pi: ExtensionAPI) {
     {
       name: "lavra-ship",
       description: "Ship completed work: git push, bd close, verify",
-      handler: async (_args, ctx) => {
-        ctx.ui.notify("Lavra Ship: pushing to remote...", "info");
+      handler: async (args, ctx) => {
+        sendCommandFile("lavra-ship", args, ctx);
       },
     },
     {
       name: "lavra-retro",
       description: "Session retrospective: review progress, file follow-up beads",
-      handler: async (_args, ctx) => {
-        ctx.ui.notify("Lavra Retro: generating session summary...", "info");
+      handler: async (args, ctx) => {
+        sendCommandFile("lavra-retro", args, ctx);
       },
     },
+    {
+      name: "lavra-work-ralph",
+      description: "Autonomous retry mode — iterates until completion or budget exhausted",
+      handler: async (args, ctx) => {
+        sendCommandFile("lavra-work-ralph", args, ctx);
+      },
+    },
+    {
+      name: "lavra-work-teams",
+      description: "Spawn persistent worker teammates that self-organize through a ready queue",
+      handler: async (args, ctx) => {
+        sendCommandFile("lavra-work-teams", args, ctx);
+      },
+    },
+    {
+      name: "lavra-import",
+      description: "Import a markdown plan into beads as an epic with child tasks",
+      handler: async (args, ctx) => {
+        sendCommandFile("lavra-import", args, ctx);
     {
       name: "lavra-ready",
       description: "Show ready beads count (replaces Claude Code TeammateIdle hook)",
