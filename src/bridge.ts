@@ -858,6 +858,8 @@ export default function (pi: ExtensionAPI) {
       description: "Import a markdown plan into beads as an epic with child tasks",
       handler: async (args, ctx) => {
         sendCommandFile("lavra-import", args, ctx);
+      },
+    },
     {
       name: "lavra-ready",
       description: "Show ready beads count (replaces Claude Code TeammateIdle hook)",
