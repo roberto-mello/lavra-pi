@@ -17,8 +17,6 @@
     ],
     "skills": [
       "./node_modules/@lavralabs/lavra/plugins/lavra/skills",
-      "!./node_modules/@lavralabs/lavra/plugins/lavra/skills/agent-browser",
-      "!./node_modules/@lavralabs/lavra/plugins/lavra/skills/optional/frontend-design",
       "./node_modules/pi-ask-user/skills"
     ]
   },

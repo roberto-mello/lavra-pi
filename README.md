@@ -21,7 +21,7 @@ The extension discovers agents from there at startup.
 | Feature | How It Works |
 |---|---|
 | **30 agents** (review, research, design, workflow, docs) | Loaded from `node_modules/@lavralabs/lavra/plugins/lavra/agents/` |
-| **15+ skills** (SKILL.md) | Agents discover them at runtime by globbing `**/**/SKILL.md` during research — not pre-loaded by pi |
+| **Skills** (SKILL.md) | Lavra agents receive bundled, project-local, and user skill directories; skills load on demand |
 | **~17 commands** (`/lavra-work`, `/lavra-design`, etc.) | `pi.registerCommand()` — registered at startup |
 | **Auto-recall** (session start knowledge injection) | `session_start` event handler reads knowledge.jsonl + session state |
 | **Memory capture** (post-tool knowledge extraction) | `tool_result` event intercepts `bd comments add` |
@@ -29,7 +29,7 @@ The extension discovers agents from there at startup.
 | **Web search** | `web_search` tool — Brave API or agent-browser fallback |
 | **Framework docs** (Context7) | `framework_docs` tool — direct `fetch()`, no MCP server |
 | **Subagents** | Custom `lavra_subagent` tool — single/parallel/chain modes; Claude `Task(...)` is translated to it |
-| **Subagent progress** | Scrollable live overlay streams agent text and tool activity; `↑/↓`, `PgUp/PgDn`, `q` cancel |
+| **Subagent sessions** | On-demand live transcript viewer; `Ctrl-X`, `↓` opens it, `←/→` switches agents, `↑` returns to the main session |
 | **User questions** | Bundled `pi-ask-user` package provides the `ask_user` tool for `AskUserQuestion` workflows |
 | **Subagent wrapup** (log learnings before exit) | Built into subagent tool — prompts `LEARNED:`/`DECISION:` comments |
 | **Model routing per agent** | `haiku`/`sonnet`/`inherit` labels resolve to configured Pi models |

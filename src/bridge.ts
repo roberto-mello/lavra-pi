@@ -23,10 +23,12 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
+  CustomEditor,
   type ExtensionAPI,
   type ExtensionContext,
   isToolCallEventType,
 } from "@earendil-works/pi-coding-agent";
+import { Key, matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // ═══════════════════════════════════════════════════
@@ -464,15 +466,77 @@ function captureKnowledgeFromBashCommand(
 // Subagent Execution (spawns pi --mode json subprocess)
 // ═══════════════════════════════════════════════════
 
+type SubagentTranscriptKind = "assistant" | "thinking" | "tool" | "status";
+
+interface SubagentTranscriptEvent {
+  kind: SubagentTranscriptKind;
+  text: string;
+  append?: boolean;
+}
+
+interface SubagentSession {
+  label: string;
+  task: string;
+  status: string;
+  entries: Array<{ kind: SubagentTranscriptKind; text: string }>;
+}
+
+class SubagentSessionStore {
+  private readonly sessions: SubagentSession[] = [];
+  private readonly listeners = new Set<() => void>();
+
+  create(label: string, task: string): SubagentSession {
+    const session = { label, task, status: "starting", entries: [] };
+    this.sessions.push(session);
+    this.notify();
+    return session;
+  }
+
+  getSessions(): readonly SubagentSession[] { return this.sessions; }
+
+  updateStatus(session: SubagentSession, text: string): void {
+    const status = text.startsWith("responding:") ? "responding" : text;
+    if (session.status === status) return;
+    session.status = status;
+    this.notify();
+  }
+
+  append(session: SubagentSession, event: SubagentTranscriptEvent): void {
+    if (!event.text) return;
+    const last = session.entries[session.entries.length - 1];
+    if (event.append && last?.kind === event.kind) last.text += event.text;
+    else session.entries.push({ kind: event.kind, text: event.text });
+    if (session.entries.length > 1000) session.entries.splice(0, session.entries.length - 1000);
+    this.notify();
+  }
+
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  private notify(): void { for (const listener of this.listeners) listener(); }
+}
+
+function availableSkillDirectories(cwd: string): string[] {
+  const projectRoot = findProjectRoot(cwd);
+  const roots = [cwd, projectRoot, os.homedir()];
+  const suffixes = [".pi/skills", ".agents/skills", ".claude/skills", ".codex/skills"];
+  return [...new Set(roots.flatMap((root) => suffixes.map((suffix) => path.join(root, suffix))))]
+    .filter((dir) => fs.existsSync(dir));
+}
+
 async function runAgent(
   agent: AgentDef,
   task: string,
   cwd: string,
   signal?: AbortSignal,
   onProgress?: (text: string) => void,
+  onTranscript?: (event: SubagentTranscriptEvent) => void,
   modelOverride?: string,
 ): Promise<{ output: string; error?: string; usage: any }> {
   const args: string[] = ["--mode", "json", "-p", "--no-session"];
+  for (const skillsDir of availableSkillDirectories(cwd)) args.push("--skill", skillsDir);
   if (modelOverride) args.push("--model", modelOverride);
   if (agent.tools && agent.tools.length > 0) {
     args.push("--tools", agent.tools.join(","));
@@ -515,15 +579,23 @@ async function runAgent(
             const update = evt.assistantMessageEvent;
             if (update?.type === "text_delta" && update.delta) {
               liveText += update.delta;
+              onTranscript?.({ kind: "assistant", text: update.delta, append: true });
               onProgress?.(`responding: ${liveText.slice(-180)}`);
             } else if (update?.type === "thinking_start") {
+              onTranscript?.({ kind: "thinking", text: "Thinking..." });
+              onProgress?.("thinking...");
+            } else if (update?.type === "thinking_delta" && update.delta) {
+              onTranscript?.({ kind: "thinking", text: update.delta, append: true });
               onProgress?.("thinking...");
             } else if (update?.type === "toolcall_start") {
+              onTranscript?.({ kind: "tool", text: "Preparing tool call..." });
               onProgress?.("preparing tool call...");
             }
           } else if (evt.type === "tool_execution_start") {
+            onTranscript?.({ kind: "tool", text: `Running ${evt.toolName}` });
             onProgress?.(`running ${evt.toolName}`);
           } else if (evt.type === "tool_execution_end") {
+            onTranscript?.({ kind: "tool", text: `${evt.isError ? "Failed" : "Finished"} ${evt.toolName}` });
             onProgress?.(`${evt.isError ? "failed" : "finished"} ${evt.toolName}`);
           } else if (evt.type === "message_end" && evt.message) {
             messages.push(evt.message);
@@ -531,6 +603,7 @@ async function runAgent(
               if (part.type === "text") {
                 stdout = part.text;
                 liveText = part.text;
+                if (evt.message.role === "toolResult") onTranscript?.({ kind: "tool", text: part.text });
               }
             }
           }
@@ -576,69 +649,105 @@ async function runAgent(
 }
 
 interface SubagentProgressSink {
-  update(label: string, text: string): void;
+  start(label: string, task: string): SubagentSession;
+  update(session: SubagentSession, text: string): void;
+  transcript(session: SubagentSession, event: SubagentTranscriptEvent): void;
 }
 
-class SubagentProgressPanel {
-  private readonly entries: Array<{ label: string; text: string }> = [];
+class SubagentSessionViewer {
+  private selected = 0;
   private scrollFromBottom = 0;
-  private cancelled = false;
-  private readonly theme: any;
-  private readonly onCancel: () => void;
 
-  constructor(theme: any, onCancel: () => void) {
-    this.theme = theme;
-    this.onCancel = onCancel;
-  }
-
-  update(label: string, text: string): void {
-    const clean = String(text).replace(/\s+/g, " ").trim();
-    if (!clean) return;
-    this.entries.push({ label, text: clean });
-    if (this.entries.length > 500) this.entries.shift();
-    if (this.scrollFromBottom === 0) this.invalidate();
-  }
+  constructor(
+    private readonly store: SubagentSessionStore,
+    private readonly theme: any,
+    private readonly onClose: () => void,
+    private readonly requestRender: () => void,
+  ) {}
 
   render(width: number): string[] {
-    const title = this.cancelled
-      ? "Lavra subagents — cancellation requested"
-      : "Lavra subagents — ↑/↓ scroll, PgUp/PgDn page, q cancel";
-    const header = this.theme.fg("accent", title);
-    const rows = this.entries.map((entry) =>
-      `${this.theme.fg("accent", `[${entry.label}]`)} ${entry.text}`,
-    );
-    const maxRows = 18;
-    const end = Math.max(0, rows.length - this.scrollFromBottom);
-    const start = Math.max(0, end - maxRows);
-    const visible = rows.slice(start, end);
-    return [header, ...visible].map((line) => {
-      // Keep the custom component within the terminal width.
-      const plain = line.replace(/\x1b\[[0-9;]*m/g, "");
-      if (plain.length <= width) return line;
-      return line.slice(0, Math.max(0, width - 1)) + "…";
-    });
+    const sessions = this.store.getSessions();
+    if (sessions.length === 0) return [this.theme.fg("muted", "No subagent sessions are active."), "", "↑ return to the main session"];
+    const session = sessions[Math.min(this.selected, sessions.length - 1)];
+    const header = this.theme.fg("accent", `Lavra subagent ${this.selected + 1}/${sessions.length} — ${session.label} — ${session.status}`);
+    const help = this.theme.fg("dim", "←/→ switch subagent • ↑ return to main • PgUp/PgDn scroll");
+    const task = session.task ? this.theme.fg("muted", `Task: ${session.task}`) : "";
+    const contentWidth = Math.max(20, width - 2);
+    const rows: string[] = [header, help, task, ""];
+    for (const entry of session.entries) {
+      const color = entry.kind === "assistant" ? "text" : entry.kind === "thinking" ? "thinkingHigh" : entry.kind === "tool" ? "warning" : "dim";
+      const prefix = entry.kind === "assistant" ? "" : `[${entry.kind}] `;
+      rows.push(...wrapTextWithAnsi(this.theme.fg(color, prefix + entry.text), contentWidth));
+    }
+    const maxRows = 30;
+    const end = Math.max(maxRows, rows.length - this.scrollFromBottom);
+    return rows.slice(Math.max(0, end - maxRows), end).map((line) => truncateToWidth(line, width));
   }
 
   handleInput(data: string): void {
-    if (data === "q" || data === "\u001b") {
-      if (!this.cancelled) {
-        this.cancelled = true;
-        this.onCancel();
-        this.invalidate();
-      }
+    const sessions = this.store.getSessions();
+    if (matchesKey(data, Key.up) || matchesKey(data, Key.escape)) {
+      this.onClose();
       return;
     }
-    const page = 8;
-    if (data === "\u001b[A") this.scrollFromBottom = Math.min(this.entries.length, this.scrollFromBottom + 1);
-    else if (data === "\u001b[B") this.scrollFromBottom = Math.max(0, this.scrollFromBottom - 1);
-    else if (data === "\u001b[5~") this.scrollFromBottom = Math.min(this.entries.length, this.scrollFromBottom + page);
-    else if (data === "\u001b[6~") this.scrollFromBottom = Math.max(0, this.scrollFromBottom - page);
-    else return;
-    this.invalidate();
+    if (matchesKey(data, Key.right) && sessions.length > 1) {
+      this.selected = (this.selected + 1) % sessions.length;
+      this.scrollFromBottom = 0;
+    } else if (matchesKey(data, Key.left) && sessions.length > 1) {
+      this.selected = (this.selected + sessions.length - 1) % sessions.length;
+      this.scrollFromBottom = 0;
+    } else if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.home)) {
+      this.scrollFromBottom = Math.min(this.currentEntryCount(), this.scrollFromBottom + 20);
+    } else if (matchesKey(data, Key.pageDown) || matchesKey(data, Key.end) || matchesKey(data, Key.down)) {
+      this.scrollFromBottom = Math.max(0, this.scrollFromBottom - (matchesKey(data, Key.down) ? 1 : 20));
+    } else {
+      return;
+    }
+    this.requestRender();
   }
 
-  invalidate(): void {
-    // Rendering is computed from current state.
+  invalidate(): void {}
+
+  private currentEntryCount(): number {
+    return this.store.getSessions()[this.selected]?.entries.length ?? 0;
+  }
+}
+
+class SubagentChordEditor extends CustomEditor {
+  private pendingCtrlX: string | undefined;
+  private pendingTimer: ReturnType<typeof setTimeout> | undefined;
+
+  constructor(tui: any, theme: any, keybindings: any, private readonly onSubagentViewer: () => void) {
+    super(tui, theme, keybindings);
+  }
+
+  override handleInput(data: string): void {
+    if (this.pendingCtrlX !== undefined) {
+      if (matchesKey(data, Key.down)) {
+        this.clearPendingCtrlX();
+        this.onSubagentViewer();
+        return;
+      }
+      const previous = this.pendingCtrlX;
+      this.clearPendingCtrlX();
+      super.handleInput(previous);
+    }
+    if (matchesKey(data, Key.ctrl("x"))) {
+      this.pendingCtrlX = data;
+      this.pendingTimer = setTimeout(() => {
+        const pending = this.pendingCtrlX;
+        this.clearPendingCtrlX();
+        if (pending !== undefined) super.handleInput(pending);
+      }, 450);
+      return;
+    }
+    super.handleInput(data);
+  }
+
+  private clearPendingCtrlX(): void {
+    if (this.pendingTimer !== undefined) clearTimeout(this.pendingTimer);
+    this.pendingTimer = undefined;
+    this.pendingCtrlX = undefined;
   }
 }
 
@@ -732,6 +841,11 @@ export default function (pi: ExtensionAPI) {
     return requested.includes("/") ? requested : current;
   }
 
+  // Make project/user skills available to the main session and every child Pi.
+  pi.on("resources_discover", (event) => ({
+    skillPaths: availableSkillDirectories(event.cwd),
+  }));
+
   // ════════════════════════════════════════════
   //  1. SESSION_START → Auto-Recall
   // ════════════════════════════════════════════
@@ -739,6 +853,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     // Quick check: is this a Lavra project?
     if (!isLavraProject(ctx.cwd)) return;
+    if (ctx.mode === "tui") ctx.ui.setEditorComponent(subagentEditorFactory(ctx));
     const projectRoot = findProjectRoot(ctx.cwd);
 
     try {
@@ -820,12 +935,19 @@ export default function (pi: ExtensionAPI) {
     return isLavraProject(cwd);
   }
 
-  function skillFilePath(name: string): string | null {
-    // Skill names come from Lavra-controlled files, not user input. Keep the
-    // validation anyway so a model cannot turn this into path traversal.
+  function skillFilePath(name: string, cwd?: string): string | null {
+    // Skill names come from controlled skill metadata; reject path traversal.
     if (!/^[a-z0-9][a-z0-9-]*$/.test(name)) return null;
-    const file = path.join(lavraPluginsPath(), "skills", name, "SKILL.md");
-    return fs.existsSync(file) ? file : null;
+    const roots = cwd ? [cwd, findProjectRoot(cwd)] : [];
+    const dirs = [".pi/skills", ".agents/skills", ".claude/skills", ".codex/skills"];
+    for (const root of [...new Set(roots)]) {
+      for (const dir of dirs) {
+        const file = path.join(root, dir, name, "SKILL.md");
+        if (fs.existsSync(file)) return file;
+      }
+    }
+    const bundled = path.join(lavraPluginsPath(), "skills", name, "SKILL.md");
+    return fs.existsSync(bundled) ? bundled : null;
   }
 
   /**
@@ -833,7 +955,7 @@ export default function (pi: ExtensionAPI) {
    * lavra_skill tool. Inlining every skill would create huge prompts and
    * would recursively expand workflow cycles, so skills are loaded on demand.
    */
-  function translateSkillDirectives(content: string, commandArgs: string): string {
+  function translateSkillDirectives(content: string, commandArgs: string, cwd?: string): string {
     let output = "";
     let cursor = 0;
     let searchFrom = 0;
@@ -878,7 +1000,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const name = nameMatch[1] || nameMatch[2];
-      if (!skillFilePath(name)) {
+      if (!skillFilePath(name, cwd)) {
         output += content.slice(cursor, match.index);
         output += `[Pi adaptation: skill "${name}" is unavailable.]`;
       } else {
@@ -900,7 +1022,7 @@ export default function (pi: ExtensionAPI) {
 
   /** Dispatch a skill through Pi's native /skill:name expansion. */
   function dispatchSkill(name: string, args: string, ctx: ExtensionContext): void {
-    if (!skillFilePath(name)) {
+    if (!skillFilePath(name, ctx.cwd)) {
       ctx.ui.notify(`Lavra skill not found: ${name}`, "error");
       return;
     }
@@ -1021,9 +1143,9 @@ export default function (pi: ExtensionAPI) {
   }
 
   /** Adapt Claude-only directives in expanded skill/user messages. */
-  function adaptClaudeMessageText(text: string): string {
+  function adaptClaudeMessageText(text: string, cwd?: string): string {
     return translateTaskDirectives(
-      translateSkillDirectives(text, "")
+      translateSkillDirectives(text, "", cwd)
         .replace(/\bAskUserQuestion\s+tool\b/g, "the `ask_user` tool")
         .replace(/\bAskUserQuestion\b/g, "the `ask_user` tool"),
     );
@@ -1058,7 +1180,7 @@ export default function (pi: ExtensionAPI) {
       arguments: Type.Optional(Type.String({ description: "Arguments to pass to the skill" })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-      const file = skillFilePath(params.name);
+      const file = skillFilePath(params.name, _ctx.cwd);
       if (!file) {
         return {
           content: [{ type: "text", text: `Lavra skill not found: ${params.name}` }],
@@ -1068,6 +1190,7 @@ export default function (pi: ExtensionAPI) {
       const skill = translateSkillDirectives(
         fs.readFileSync(file, "utf-8"),
         params.arguments ?? "",
+        _ctx.cwd,
       );
       const args = params.arguments
         ? `\n\nUser arguments for this skill:\n<untrusted-input>${params.arguments}</untrusted-input>`
@@ -1331,17 +1454,17 @@ export default function (pi: ExtensionAPI) {
 
   // Native /skill expansion loads raw SKILL.md text. Adapt nested Claude
   // directives just before the provider sees that expanded context.
-  pi.on("context", async (event) => {
+  pi.on("context", async (event, ctx) => {
     const messages = event.messages.map((message: any) => {
       if (message.role !== "user") return message;
       if (typeof message.content === "string") {
-        return { ...message, content: adaptClaudeMessageText(message.content) };
+        return { ...message, content: adaptClaudeMessageText(message.content, ctx.cwd) };
       }
       if (!Array.isArray(message.content)) return message;
       return {
         ...message,
         content: message.content.map((part: any) =>
-          part.type === "text" ? { ...part, text: adaptClaudeMessageText(part.text) } : part,
+          part.type === "text" ? { ...part, text: adaptClaudeMessageText(part.text, ctx.cwd) } : part,
         ),
       };
     });
@@ -1364,55 +1487,52 @@ export default function (pi: ExtensionAPI) {
       : agents.find((agent) => agent.name === name);
   }
 
+  let activeSubagentStore: SubagentSessionStore | undefined;
+  let subagentViewerOpen = false;
+
   async function withSubagentProgress<T>(
-    ctx: ExtensionContext,
+    _ctx: ExtensionContext,
     signal: AbortSignal | undefined,
     work: (progress: SubagentProgressSink | undefined, runSignal: AbortSignal | undefined) => Promise<T>,
   ): Promise<T> {
-    if (!ctx.hasUI) return work(undefined, signal);
-
-    let failure: unknown;
-    const result = await ctx.ui.custom<T | undefined>((tui, theme, _keybindings, done) => {
-      const cancelController = new AbortController();
-      const runSignal = signal
-        ? AbortSignal.any([signal, cancelController.signal])
-        : cancelController.signal;
-      const panel = new SubagentProgressPanel(theme, () => cancelController.abort());
-      const progress: SubagentProgressSink = {
-        update: (label, text) => {
-          panel.update(label, text);
-          tui.requestRender();
-        },
-      };
-
-      work(progress, runSignal)
-        .then((value) => done(value))
-        .catch((error) => {
-          failure = error;
-          done(undefined);
-        });
-
-      return {
-        render: (width: number) => panel.render(width),
-        handleInput: (data: string) => {
-          panel.handleInput(data);
-          tui.requestRender();
-        },
-        invalidate: () => panel.invalidate(),
-      };
-    }, {
-      overlay: true,
-      overlayOptions: {
-        anchor: "bottom-right",
-        width: "80%",
-        maxHeight: "60%",
-        margin: 1,
-      },
-    });
-
-    if (failure) throw failure;
-    return result as T;
+    const store = new SubagentSessionStore();
+    activeSubagentStore = store;
+    const progress: SubagentProgressSink = {
+      start: (label, task) => store.create(label, task),
+      update: (session, text) => store.updateStatus(session, text),
+      transcript: (session, event) => store.append(session, event),
+    };
+    return work(progress, signal);
   }
+
+  async function openSubagentViewer(ctx: ExtensionContext): Promise<void> {
+    const store = activeSubagentStore;
+    if (ctx.mode !== "tui" || !store) {
+      if (ctx.hasUI) ctx.ui.notify("No subagent session is available to review.", "info");
+      return;
+    }
+    if (subagentViewerOpen) return;
+    subagentViewerOpen = true;
+    try {
+      await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+        const unsubscribe = store.subscribe(() => tui.requestRender());
+        const close = () => { unsubscribe(); done(); };
+        const viewer = new SubagentSessionViewer(store, theme, close, () => tui.requestRender());
+        return {
+          render: (width: number) => viewer.render(width),
+          handleInput: (data: string) => { viewer.handleInput(data); tui.requestRender(); },
+          invalidate: () => viewer.invalidate(),
+        };
+      });
+    } finally {
+      subagentViewerOpen = false;
+    }
+  }
+
+  pi.registerShortcut(Key.ctrl("down"), {
+    description: "Review subagent sessions (Ctrl-X, Down also works)",
+    handler: (ctx) => openSubagentViewer(ctx),
+  });
 
   async function runTrackedAgent(
     agent: AgentDef,
@@ -1423,17 +1543,21 @@ export default function (pi: ExtensionAPI) {
     progress: SubagentProgressSink | undefined,
   ) {
     const model = resolveAgentModel(agent, ctx);
-    progress?.update(label, `starting (${model ?? "default model"})`);
+    const session = progress?.start(label, task);
+    if (session) progress.update(session, `starting (${model ?? "default model"})`);
     const result = await runAgent(
-      agent,
-      task,
-      ctx.cwd,
-      signal,
-      (text) => progress?.update(label, text),
+      agent, task, ctx.cwd, signal,
+      (text) => session && progress?.update(session, text),
+      (event) => session && progress?.transcript(session, event),
       model,
     );
-    progress?.update(label, result.error ? `failed: ${result.error}` : "complete");
+    if (session) progress?.update(session, result.error ? `failed: ${result.error}` : "complete");
     return result;
+  }
+
+  function subagentEditorFactory(ctx: ExtensionContext) {
+    return (tui: any, theme: any, keybindings: any) =>
+      new SubagentChordEditor(tui, theme, keybindings, () => { void openSubagentViewer(ctx); });
   }
 
   // ════════════════════════════════════════════
