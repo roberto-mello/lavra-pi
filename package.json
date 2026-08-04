@@ -11,7 +11,12 @@
   "repository": "https://github.com/roberto-mello/lavra-pi",
   "homepage": "https://lavra.dev",
   "pi": {
-    "extensions": ["./src/bridge.ts"]
+    "extensions": ["./src/bridge.ts"],
+    "skills": [
+      "./node_modules/@lavralabs/lavra/plugins/lavra/skills",
+      "!./node_modules/@lavralabs/lavra/plugins/lavra/skills/agent-browser",
+      "!./node_modules/@lavralabs/lavra/plugins/lavra/skills/optional/frontend-design"
+    ]
   },
   "dependencies": {
     "@lavralabs/lavra": "^0.7.6"
