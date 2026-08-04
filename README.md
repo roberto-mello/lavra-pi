@@ -31,7 +31,8 @@ The extension discovers agents from there at startup.
 | **Subagents** | Custom `lavra_subagent` tool — single/parallel/chain modes; Claude `Task(...)` is translated to it |
 | **User questions** | Bundled `pi-ask-user` package provides the `ask_user` tool for `AskUserQuestion` workflows |
 | **Subagent wrapup** (log learnings before exit) | Built into subagent tool — prompts `LEARNED:`/`DECISION:` comments |
-| **Model routing per agent** | Agent `model:` frontmatter → `--model` flag to subagent pi process |
+| **Model routing per agent** | `haiku`/`sonnet`/`inherit` labels resolve to configured Pi models |
+| **Model setup** | `/lavra-models` queries Pi's available models and saves `.lavra/config/pi-models.json` |
 
 ### Skill Dispatch and Conflicts
 
@@ -89,6 +90,21 @@ The memory capture and recall system matches the existing Lavra
 | **CLI** | `/lavra-recall <query>` or `knowledge_search` tool (both use FTS5) |
 
 Requires `sqlite3` CLI (already required by Lavra).
+
+### Model routing
+
+Lavra agent frontmatter uses logical tiers rather than provider-specific IDs:
+
+```yaml
+model: haiku   # fast/cheap
+model: sonnet  # quality
+model: inherit # current parent model
+```
+
+Run `/lavra-models` in an interactive session to choose the Pi model for
+`haiku` and `sonnet` agents. The choices are saved per project in
+`.lavra/config/pi-models.json`. Explicit `provider/model` values are also
+passed through unchanged.
 
 ## Hook Replacement Map
 

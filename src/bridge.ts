@@ -113,6 +113,31 @@ interface KnowledgeEntry {
   bead: string;
 }
 
+interface LavraModelConfig {
+  haiku?: string;
+  sonnet?: string;
+}
+
+const MODEL_CONFIG_RELATIVE = ".lavra/config/pi-models.json";
+
+function modelConfigPath(projectRoot: string): string {
+  return path.join(projectRoot, MODEL_CONFIG_RELATIVE);
+}
+
+function readModelConfig(projectRoot: string): LavraModelConfig {
+  try {
+    return JSON.parse(fs.readFileSync(modelConfigPath(projectRoot), "utf-8"));
+  } catch {
+    return {};
+  }
+}
+
+function writeModelConfig(projectRoot: string, config: LavraModelConfig): void {
+  const file = modelConfigPath(projectRoot);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(config, null, 2) + "\n", "utf-8");
+}
+
 // ═══════════════════════════════════════════════════
 // Agent Discovery (from @lavralabs/lavra npm package)
 // ═══════════════════════════════════════════════════
@@ -131,7 +156,7 @@ function discoverAgents(): AgentDef[] {
       agents.push({
         name: fm.name,
         description: fm.description ?? "",
-        model: fm.model ?? "sonnet",
+        model: fm.model ?? "inherit",
         tools: fm.tools?.split(",").map((s: string) => s.trim()).filter(Boolean) ?? [],
         color: fm.color ?? "blue",
         category: cat,
@@ -445,9 +470,10 @@ async function runAgent(
   cwd: string,
   signal?: AbortSignal,
   onProgress?: (text: string) => void,
+  modelOverride?: string,
 ): Promise<{ output: string; error?: string; usage: any }> {
   const args: string[] = ["--mode", "json", "-p", "--no-session"];
-  if (agent.model) args.push("--model", agent.model);
+  if (modelOverride) args.push("--model", modelOverride);
   if (agent.tools && agent.tools.length > 0) {
     args.push("--tools", agent.tools.join(","));
   }
@@ -602,6 +628,26 @@ export default function (pi: ExtensionAPI) {
   } catch (err: any) {
     // Will surface at first agent tool use if @lavralabs/lavra isn't installed
     agents = [];
+  }
+
+  function activeModelId(ctx: ExtensionContext): string | undefined {
+    return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+  }
+
+  function resolveAgentModel(agent: AgentDef, ctx: ExtensionContext): string | undefined {
+    const requested = (agent.model || "inherit").trim();
+    const current = activeModelId(ctx);
+    if (!requested || requested === "inherit" || requested === "current") return current;
+
+    if (requested === "haiku" || requested === "sonnet") {
+      const configured = readModelConfig(findProjectRoot(ctx.cwd))[requested];
+      return configured && configured !== "inherit" && configured !== "current"
+        ? configured
+        : current;
+    }
+
+    // Explicit Pi model IDs are passed through unchanged.
+    return requested.includes("/") ? requested : current;
   }
 
   // ════════════════════════════════════════════
@@ -1100,6 +1146,51 @@ export default function (pi: ExtensionAPI) {
       },
     },
     {
+      name: "lavra-models",
+      description: "Choose Pi models for Lavra fast (haiku) and quality (sonnet) agents",
+      handler: async (_args, ctx) => {
+        if (!ctx.hasUI) {
+          ctx.ui.notify("Run /lavra-models in interactive Pi mode.", "warning");
+          return;
+        }
+
+        try {
+          await ctx.modelRegistry.refresh();
+        } catch {
+          // Use the currently loaded catalogue if refresh is unavailable.
+        }
+        const available = ctx.modelRegistry.getAvailable();
+        if (available.length === 0) {
+          ctx.ui.notify("No authenticated Pi models are available.", "error");
+          return;
+        }
+
+        const options = [
+          "inherit",
+          ...available.map((model) => `${model.provider}/${model.id}`),
+        ];
+        const haiku = await ctx.ui.select(
+          "Lavra fast-agent model (haiku)",
+          options,
+        );
+        if (!haiku) return;
+        const sonnet = await ctx.ui.select(
+          "Lavra quality-agent model (sonnet)",
+          options,
+        );
+        if (!sonnet) return;
+
+        writeModelConfig(findProjectRoot(ctx.cwd), {
+          haiku: haiku === "inherit" ? "inherit" : haiku,
+          sonnet: sonnet === "inherit" ? "inherit" : sonnet,
+        });
+        ctx.ui.notify(
+          `Lavra models saved: haiku=${haiku}, sonnet=${sonnet}`,
+          "success",
+        );
+      },
+    },
+    {
       name: "lavra-ready",
       description: "Show ready beads count (replaces Claude Code TeammateIdle hook)",
       handler: async (_args, ctx) => {
@@ -1122,7 +1213,8 @@ export default function (pi: ExtensionAPI) {
       description: "Initialize Lavra in this project (bd init, provision memory)",
       handler: async (_args, ctx) => {
         ctx.ui.notify("Lavra Setup: initializing project...", "info");
-        // Run provisioning from vendored hooks
+        const projectRoot = findProjectRoot(ctx.cwd);
+        // Run provisioning from the Lavra npm package hooks
         try {
           const provisionScript = path.join(HOOKS_DIR, "provision-memory.sh");
           if (fs.existsSync(provisionScript)) {
@@ -1258,7 +1350,14 @@ export default function (pi: ExtensionAPI) {
             "(Replace BEAD_ID with the actual bead ID if applicable.)"
           : params.task;
 
-        const result = await runAgent(agent, task, ctx.cwd, ctx.signal);
+        const result = await runAgent(
+          agent,
+          task,
+          ctx.cwd,
+          ctx.signal,
+          undefined,
+          resolveAgentModel(agent, ctx),
+        );
         return {
           content: [{ type: "text", text: result.output || result.error || "(no output)" }],
           isError: !!result.error,
@@ -1271,7 +1370,14 @@ export default function (pi: ExtensionAPI) {
           params.agents.map(async (a) => {
             const agent = resolveAgent(a.agent);
             if (!agent) return `## ${a.agent}: unknown agent`;
-            const r = await runAgent(agent, a.task, ctx.cwd, ctx.signal);
+            const r = await runAgent(
+              agent,
+              a.task,
+              ctx.cwd,
+              ctx.signal,
+              undefined,
+              resolveAgentModel(agent, ctx),
+            );
             return `## ${a.agent}\n\n${r.output || r.error || "(no output)"}`;
           }),
         );
@@ -1292,7 +1398,14 @@ export default function (pi: ExtensionAPI) {
             break;
           }
           const task = step.task.replace(/\{previous\}/g, previous);
-          const result = await runAgent(agent, task, ctx.cwd, ctx.signal);
+          const result = await runAgent(
+            agent,
+            task,
+            ctx.cwd,
+            ctx.signal,
+            undefined,
+            resolveAgentModel(agent, ctx),
+          );
           if (result.error) {
             outputs.push(`Step ${i + 1} (${step.agent}) failed: ${result.error}`);
             break;
