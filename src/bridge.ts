@@ -499,6 +499,7 @@ async function runAgent(
 
     let stdout = "";
     let stderr = "";
+    let liveText = "";
     const messages: any[] = [];
     let buffer = "";
 
@@ -510,12 +511,26 @@ async function runAgent(
         if (!line.trim()) continue;
         try {
           const evt = JSON.parse(line);
-          if (evt.type === "message_end" && evt.message) {
+          if (evt.type === "message_update") {
+            const update = evt.assistantMessageEvent;
+            if (update?.type === "text_delta" && update.delta) {
+              liveText += update.delta;
+              onProgress?.(`responding: ${liveText.slice(-180)}`);
+            } else if (update?.type === "thinking_start") {
+              onProgress?.("thinking...");
+            } else if (update?.type === "toolcall_start") {
+              onProgress?.("preparing tool call...");
+            }
+          } else if (evt.type === "tool_execution_start") {
+            onProgress?.(`running ${evt.toolName}`);
+          } else if (evt.type === "tool_execution_end") {
+            onProgress?.(`${evt.isError ? "failed" : "finished"} ${evt.toolName}`);
+          } else if (evt.type === "message_end" && evt.message) {
             messages.push(evt.message);
             for (const part of evt.message.content ?? []) {
               if (part.type === "text") {
                 stdout = part.text;
-                onProgress?.(part.text);
+                liveText = part.text;
               }
             }
           }
@@ -558,6 +573,73 @@ async function runAgent(
       else signal.addEventListener("abort", kill, { once: true });
     }
   });
+}
+
+interface SubagentProgressSink {
+  update(label: string, text: string): void;
+}
+
+class SubagentProgressPanel {
+  private readonly entries: Array<{ label: string; text: string }> = [];
+  private scrollFromBottom = 0;
+  private cancelled = false;
+  private readonly theme: any;
+  private readonly onCancel: () => void;
+
+  constructor(theme: any, onCancel: () => void) {
+    this.theme = theme;
+    this.onCancel = onCancel;
+  }
+
+  update(label: string, text: string): void {
+    const clean = String(text).replace(/\s+/g, " ").trim();
+    if (!clean) return;
+    this.entries.push({ label, text: clean });
+    if (this.entries.length > 500) this.entries.shift();
+    if (this.scrollFromBottom === 0) this.invalidate();
+  }
+
+  render(width: number): string[] {
+    const title = this.cancelled
+      ? "Lavra subagents — cancellation requested"
+      : "Lavra subagents — ↑/↓ scroll, PgUp/PgDn page, q cancel";
+    const header = this.theme.fg("accent", title);
+    const rows = this.entries.map((entry) =>
+      `${this.theme.fg("accent", `[${entry.label}]`)} ${entry.text}`,
+    );
+    const maxRows = 18;
+    const end = Math.max(0, rows.length - this.scrollFromBottom);
+    const start = Math.max(0, end - maxRows);
+    const visible = rows.slice(start, end);
+    return [header, ...visible].map((line) => {
+      // Keep the custom component within the terminal width.
+      const plain = line.replace(/\x1b\[[0-9;]*m/g, "");
+      if (plain.length <= width) return line;
+      return line.slice(0, Math.max(0, width - 1)) + "…";
+    });
+  }
+
+  handleInput(data: string): void {
+    if (data === "q" || data === "\u001b") {
+      if (!this.cancelled) {
+        this.cancelled = true;
+        this.onCancel();
+        this.invalidate();
+      }
+      return;
+    }
+    const page = 8;
+    if (data === "\u001b[A") this.scrollFromBottom = Math.min(this.entries.length, this.scrollFromBottom + 1);
+    else if (data === "\u001b[B") this.scrollFromBottom = Math.max(0, this.scrollFromBottom - 1);
+    else if (data === "\u001b[5~") this.scrollFromBottom = Math.min(this.entries.length, this.scrollFromBottom + page);
+    else if (data === "\u001b[6~") this.scrollFromBottom = Math.max(0, this.scrollFromBottom - page);
+    else return;
+    this.invalidate();
+  }
+
+  invalidate(): void {
+    // Rendering is computed from current state.
+  }
 }
 
 // ═══════════════════════════════════════════════════
@@ -1282,6 +1364,78 @@ export default function (pi: ExtensionAPI) {
       : agents.find((agent) => agent.name === name);
   }
 
+  async function withSubagentProgress<T>(
+    ctx: ExtensionContext,
+    signal: AbortSignal | undefined,
+    work: (progress: SubagentProgressSink | undefined, runSignal: AbortSignal | undefined) => Promise<T>,
+  ): Promise<T> {
+    if (!ctx.hasUI) return work(undefined, signal);
+
+    let failure: unknown;
+    const result = await ctx.ui.custom<T | undefined>((tui, theme, _keybindings, done) => {
+      const cancelController = new AbortController();
+      const runSignal = signal
+        ? AbortSignal.any([signal, cancelController.signal])
+        : cancelController.signal;
+      const panel = new SubagentProgressPanel(theme, () => cancelController.abort());
+      const progress: SubagentProgressSink = {
+        update: (label, text) => {
+          panel.update(label, text);
+          tui.requestRender();
+        },
+      };
+
+      work(progress, runSignal)
+        .then((value) => done(value))
+        .catch((error) => {
+          failure = error;
+          done(undefined);
+        });
+
+      return {
+        render: (width: number) => panel.render(width),
+        handleInput: (data: string) => {
+          panel.handleInput(data);
+          tui.requestRender();
+        },
+        invalidate: () => panel.invalidate(),
+      };
+    }, {
+      overlay: true,
+      overlayOptions: {
+        anchor: "bottom-right",
+        width: "80%",
+        maxHeight: "60%",
+        margin: 1,
+      },
+    });
+
+    if (failure) throw failure;
+    return result as T;
+  }
+
+  async function runTrackedAgent(
+    agent: AgentDef,
+    task: string,
+    label: string,
+    ctx: ExtensionContext,
+    signal: AbortSignal | undefined,
+    progress: SubagentProgressSink | undefined,
+  ) {
+    const model = resolveAgentModel(agent, ctx);
+    progress?.update(label, `starting (${model ?? "default model"})`);
+    const result = await runAgent(
+      agent,
+      task,
+      ctx.cwd,
+      signal,
+      (text) => progress?.update(label, text),
+      model,
+    );
+    progress?.update(label, result.error ? `failed: ${result.error}` : "complete");
+    return result;
+  }
+
   // ════════════════════════════════════════════
   //  4. LAVRA_SUBAGENT TOOL
   //     (replaces SubagentStop hook — agents prompted to log learnings)
@@ -1332,7 +1486,8 @@ export default function (pi: ExtensionAPI) {
 
       const captureLearnings = params.capture_learnings ?? true;
 
-      // ── Single agent mode ──
+      return withSubagentProgress(ctx, signal, async (progress, runSignal) => {
+        // ── Single agent mode ──
       if (params.agent && params.task) {
         const agent = resolveAgent(params.agent);
         if (!agent) {
@@ -1350,13 +1505,13 @@ export default function (pi: ExtensionAPI) {
             "(Replace BEAD_ID with the actual bead ID if applicable.)"
           : params.task;
 
-        const result = await runAgent(
+        const result = await runTrackedAgent(
           agent,
           task,
-          ctx.cwd,
-          ctx.signal,
-          undefined,
-          resolveAgentModel(agent, ctx),
+          agent.name,
+          ctx,
+          runSignal,
+          progress,
         );
         return {
           content: [{ type: "text", text: result.output || result.error || "(no output)" }],
@@ -1370,13 +1525,13 @@ export default function (pi: ExtensionAPI) {
           params.agents.map(async (a) => {
             const agent = resolveAgent(a.agent);
             if (!agent) return `## ${a.agent}: unknown agent`;
-            const r = await runAgent(
+            const r = await runTrackedAgent(
               agent,
               a.task,
-              ctx.cwd,
-              ctx.signal,
-              undefined,
-              resolveAgentModel(agent, ctx),
+              `${a.agent} #${params.agents!.indexOf(a) + 1}`,
+              ctx,
+              runSignal,
+              progress,
             );
             return `## ${a.agent}\n\n${r.output || r.error || "(no output)"}`;
           }),
@@ -1398,13 +1553,13 @@ export default function (pi: ExtensionAPI) {
             break;
           }
           const task = step.task.replace(/\{previous\}/g, previous);
-          const result = await runAgent(
+          const result = await runTrackedAgent(
             agent,
             task,
-            ctx.cwd,
-            ctx.signal,
-            undefined,
-            resolveAgentModel(agent, ctx),
+            `step ${i + 1}: ${step.agent}`,
+            ctx,
+            runSignal,
+            progress,
           );
           if (result.error) {
             outputs.push(`Step ${i + 1} (${step.agent}) failed: ${result.error}`);
@@ -1418,10 +1573,11 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      return {
-        content: [{ type: "text", text: "Provide agent + task, agents[], or chain[]." }],
-        isError: true,
-      };
+        return {
+          content: [{ type: "text", text: "Provide agent + task, agents[], or chain[]." }],
+          isError: true,
+        };
+      });
     },
   });
 

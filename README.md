@@ -29,6 +29,7 @@ The extension discovers agents from there at startup.
 | **Web search** | `web_search` tool — Brave API or agent-browser fallback |
 | **Framework docs** (Context7) | `framework_docs` tool — direct `fetch()`, no MCP server |
 | **Subagents** | Custom `lavra_subagent` tool — single/parallel/chain modes; Claude `Task(...)` is translated to it |
+| **Subagent progress** | Scrollable live overlay streams agent text and tool activity; `↑/↓`, `PgUp/PgDn`, `q` cancel |
 | **User questions** | Bundled `pi-ask-user` package provides the `ask_user` tool for `AskUserQuestion` workflows |
 | **Subagent wrapup** (log learnings before exit) | Built into subagent tool — prompts `LEARNED:`/`DECISION:` comments |
 | **Model routing per agent** | `haiku`/`sonnet`/`inherit` labels resolve to configured Pi models |
