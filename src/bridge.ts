@@ -17,7 +17,7 @@
  *   - Optional: BRAVE_API_KEY env var for web search
  */
 
-import { spawn, execSync } from "node:child_process";
+import { spawn, execFileSync, execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -692,6 +692,215 @@ export default function (pi: ExtensionAPI) {
     return isLavraProject(cwd);
   }
 
+  function skillFilePath(name: string): string | null {
+    // Skill names come from Lavra-controlled files, not user input. Keep the
+    // validation anyway so a model cannot turn this into path traversal.
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(name)) return null;
+    const file = path.join(lavraPluginsPath(), "skills", name, "SKILL.md");
+    return fs.existsSync(file) ? file : null;
+  }
+
+  /**
+   * Translate Claude's Skill(...) directives into instructions for Pi's
+   * lavra_skill tool. Inlining every skill would create huge prompts and
+   * would recursively expand workflow cycles, so skills are loaded on demand.
+   */
+  function translateSkillDirectives(content: string, commandArgs: string): string {
+    let output = "";
+    let cursor = 0;
+    let searchFrom = 0;
+    const marker = /Skill\s*\(/gi;
+
+    while (true) {
+      marker.lastIndex = searchFrom;
+      const match = marker.exec(content);
+      if (!match) break;
+
+      const openParen = match.index + match[0].length - 1;
+      let depth = 1;
+      let quote: string | null = null;
+      let escaped = false;
+      let closeParen = -1;
+
+      for (let i = openParen + 1; i < content.length; i++) {
+        const char = content[i];
+        if (quote) {
+          if (escaped) escaped = false;
+          else if (char === "\\") escaped = true;
+          else if (char === quote) quote = null;
+        } else if (char === "\\" || char === "'" || char === '"') {
+          if (char !== "\\") quote = char;
+        } else if (char === "(") {
+          depth++;
+        } else if (char === ")" && --depth === 0) {
+          closeParen = i;
+          break;
+        }
+      }
+
+      if (closeParen < 0) break;
+
+      const body = content.slice(openParen + 1, closeParen);
+      const nameMatch = body.match(/^\s*(?:["']([^"']+)["']|([a-z0-9][a-z0-9-]*))/i);
+      if (!nameMatch) {
+        output += content.slice(cursor, closeParen + 1);
+        cursor = closeParen + 1;
+        searchFrom = cursor;
+        continue;
+      }
+
+      const name = nameMatch[1] || nameMatch[2];
+      if (!skillFilePath(name)) {
+        output += content.slice(cursor, match.index);
+        output += `[Pi adaptation: skill "${name}" is unavailable.]`;
+      } else {
+        const hasExplicitArgs = body.slice(nameMatch[0].length).trim().length > 0;
+        const argsText = hasExplicitArgs
+          ? " using the arguments specified by this workflow"
+          : commandArgs
+            ? ` with arguments ${JSON.stringify(commandArgs)}`
+            : "";
+        output += content.slice(cursor, match.index);
+        output += `[Pi adaptation: call the lavra_skill tool with name "${name}"${argsText}. Then follow the returned SKILL.md instructions.]`;
+      }
+      cursor = closeParen + 1;
+      searchFrom = cursor;
+    }
+
+    return output + content.slice(cursor);
+  }
+
+  /** Dispatch a skill through Pi's native /skill:name expansion. */
+  function dispatchSkill(name: string, args: string, ctx: ExtensionContext): void {
+    if (!skillFilePath(name)) {
+      ctx.ui.notify(`Lavra skill not found: ${name}`, "error");
+      return;
+    }
+    const suffix = args.trim() ? ` ${args.trim()}` : "";
+    pi.sendUserMessage(`/skill:${name}${suffix}`);
+  }
+
+  function chooseWorkSkill(args: string, cwd: string): "lavra-work-single" | "lavra-work-multi" {
+    const input = args.replace(/--yes\b|--no-parallel\b/g, "").trim();
+    if (input.split(",").filter(Boolean).length > 1) return "lavra-work-multi";
+
+    const root = findProjectRoot(cwd);
+    try {
+      const items = input
+        ? JSON.parse(String(execFileSync("bd", ["list", "--parent", input, "--status=open", "--json"], { cwd: root, encoding: "utf-8" })))
+        : JSON.parse(String(execFileSync("bd", ["ready", "--json"], { cwd: root, encoding: "utf-8" })));
+      return Array.isArray(items) && items.length > 1 ? "lavra-work-multi" : "lavra-work-single";
+    } catch {
+      return "lavra-work-single";
+    }
+  }
+
+  function splitCallArguments(body: string): string[] {
+    const parts: string[] = [];
+    let start = 0;
+    let depth = 0;
+    let quote: string | null = null;
+    let escaped = false;
+    for (let i = 0; i < body.length; i++) {
+      const char = body[i];
+      if (quote) {
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === quote) quote = null;
+      } else if (char === "'" || char === '"') {
+        quote = char;
+      } else if (char === "(") {
+        depth++;
+      } else if (char === ")") {
+        depth--;
+      } else if (char === "," && depth === 0) {
+        parts.push(body.slice(start, i).trim());
+        start = i + 1;
+      }
+    }
+    parts.push(body.slice(start).trim());
+    return parts.filter(Boolean);
+  }
+
+  function unquote(value: string): string {
+    const trimmed = value.trim();
+    if (trimmed.length >= 2 &&
+        ((trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+         (trimmed.startsWith("'") && trimmed.endsWith("'")))) {
+      return trimmed.slice(1, -1).replace(/\\(["'\\])/g, "$1");
+    }
+    return trimmed;
+  }
+
+  /** Translate Claude Task(...) calls into Pi lavra_subagent instructions. */
+  function translateTaskDirectives(content: string): string {
+    let output = "";
+    let cursor = 0;
+    let searchFrom = 0;
+    const marker = /Task\s*\(/gi;
+
+    while (true) {
+      marker.lastIndex = searchFrom;
+      const match = marker.exec(content);
+      if (!match) break;
+      const openParen = match.index + match[0].length - 1;
+      let depth = 1;
+      let quote: string | null = null;
+      let escaped = false;
+      let closeParen = -1;
+      for (let i = openParen + 1; i < content.length; i++) {
+        const char = content[i];
+        if (quote) {
+          if (escaped) escaped = false;
+          else if (char === "\\") escaped = true;
+          else if (char === quote) quote = null;
+        } else if (char === "'" || char === '"') {
+          quote = char;
+        } else if (char === "(") {
+          depth++;
+        } else if (char === ")" && --depth === 0) {
+          closeParen = i;
+          break;
+        }
+      }
+      if (closeParen < 0) break;
+
+      const body = content.slice(openParen + 1, closeParen);
+      output += content.slice(cursor, match.index);
+      if (/\bteam_name\s*=/.test(body)) {
+        output += "[Pi adaptation: this Task is part of the deferred team workflow; TeamCreate/SendMessage support is not enabled yet.]";
+      } else {
+        const parts = splitCallArguments(body);
+        const namedAgent = body.match(/(?:subagent_type|agent)\s*=\s*(["']?)([a-z0-9][a-z0-9-]*)\1/i);
+        const agent = namedAgent?.[2] || unquote(parts[0] || "general-purpose");
+        const namedPrompt = body.match(/prompt\s*=\s*(["'])([\s\S]*)\1\s*$/i);
+        let task = namedPrompt?.[2] || "";
+        if (!task) {
+          for (let i = parts.length - 1; i >= 1; i--) {
+            if (/^["']/.test(parts[i])) {
+              task = unquote(parts[i]);
+              break;
+            }
+          }
+        }
+        if (!task) task = parts.slice(1).join(", ") || body;
+        output += `[Pi adaptation: call lavra_subagent with agent ${JSON.stringify(agent)} and task ${JSON.stringify(task)}. Do not use Claude's Task tool.]`;
+      }
+      cursor = closeParen + 1;
+      searchFrom = cursor;
+    }
+    return output + content.slice(cursor);
+  }
+
+  /** Adapt Claude-only directives in expanded skill/user messages. */
+  function adaptClaudeMessageText(text: string): string {
+    return translateTaskDirectives(
+      translateSkillDirectives(text, "")
+        .replace(/\bAskUserQuestion\s+tool\b/g, "the `ask_user` tool")
+        .replace(/\bAskUserQuestion\b/g, "the `ask_user` tool"),
+    );
+  }
+
   /** Read a command .md or skill SKILL.md from @lavralabs/lavra, inject args, send to model */
   function sendCommandFile(name: string, args: string, ctx: ExtensionContext): void {
     // Try command file first, then skill file
@@ -706,8 +915,38 @@ export default function (pi: ExtensionAPI) {
     }
     let content = fs.readFileSync(file, "utf-8");
     content = content.replace(/\$ARGUMENTS|#\$ARGUMENTS/g, args || "");
-    pi.sendUserMessage(content, { deliverAs: "nextTurn" });
+    content = adaptClaudeMessageText(content);
+    // Slash commands are invoked while idle; start the translated workflow now.
+    pi.sendUserMessage(content);
   }
+
+  // Pi-native replacement for Claude Code's Skill(...) mechanism.
+  pi.registerTool({
+    name: "lavra_skill",
+    label: "Lavra Skill",
+    description: "Load and return a Lavra SKILL.md by name. Use this when a Lavra workflow says Skill(\"name\").",
+    parameters: Type.Object({
+      name: Type.String({ description: "Lavra skill name, for example lavra-work-single" }),
+      arguments: Type.Optional(Type.String({ description: "Arguments to pass to the skill" })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const file = skillFilePath(params.name);
+      if (!file) {
+        return {
+          content: [{ type: "text", text: `Lavra skill not found: ${params.name}` }],
+          isError: true,
+        };
+      }
+      const skill = translateSkillDirectives(
+        fs.readFileSync(file, "utf-8"),
+        params.arguments ?? "",
+      );
+      const args = params.arguments
+        ? `\n\nUser arguments for this skill:\n<untrusted-input>${params.arguments}</untrusted-input>`
+        : "";
+      return { content: [{ type: "text", text: skill + args }] };
+    },
+  });
 
   const commands: Array<{
     name: string;
@@ -718,7 +957,7 @@ export default function (pi: ExtensionAPI) {
       name: "lavra-work",
       description: "Execute work on one or many beads — auto-routes single/sequential/parallel",
       handler: async (args, ctx) => {
-        sendCommandFile("lavra-work", args, ctx);
+        dispatchSkill(chooseWorkSkill(args, ctx.cwd), args, ctx);
       },
     },
     {
@@ -732,28 +971,28 @@ export default function (pi: ExtensionAPI) {
       name: "lavra-research",
       description: "Gather evidence and best practices using domain-matched research agents",
       handler: async (args, ctx) => {
-        sendCommandFile("lavra-research", args, ctx);
+        dispatchSkill("lavra-research", args, ctx);
       },
     },
     {
       name: "lavra-review",
       description: "Exhaustive code review using multi-agent analysis (4+ review agents)",
       handler: async (args, ctx) => {
-        sendCommandFile("lavra-review", args, ctx);
+        dispatchSkill("lavra-review", args, ctx);
       },
     },
     {
       name: "lavra-plan",
       description: "Create detailed implementation plan from an epic/story bead",
       handler: async (args, ctx) => {
-        sendCommandFile("lavra-plan", args, ctx);
+        dispatchSkill("lavra-plan", args, ctx);
       },
     },
     {
       name: "lavra-brainstorm",
       description: "Interactive brainstorming with structured output",
       handler: async (args, ctx) => {
-        sendCommandFile("lavra-brainstorm", args, ctx);
+        dispatchSkill("lavra-brainstorm", args, ctx);
       },
     },
     {
@@ -916,6 +1155,41 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
+  // Native /skill expansion loads raw SKILL.md text. Adapt nested Claude
+  // directives just before the provider sees that expanded context.
+  pi.on("context", async (event) => {
+    const messages = event.messages.map((message: any) => {
+      if (message.role !== "user") return message;
+      if (typeof message.content === "string") {
+        return { ...message, content: adaptClaudeMessageText(message.content) };
+      }
+      if (!Array.isArray(message.content)) return message;
+      return {
+        ...message,
+        content: message.content.map((part: any) =>
+          part.type === "text" ? { ...part, text: adaptClaudeMessageText(part.text) } : part,
+        ),
+      };
+    });
+    return { messages };
+  });
+
+  const generalPurposeAgent: AgentDef = {
+    name: "general-purpose",
+    description: "General-purpose Lavra worker",
+    model: "",
+    tools: [],
+    color: "blue",
+    category: "workflow",
+    systemPrompt: "You are a general-purpose implementation agent. Complete the delegated task carefully and report concrete results.",
+  };
+
+  function resolveAgent(name: string): AgentDef | undefined {
+    return name === "general-purpose"
+      ? generalPurposeAgent
+      : agents.find((agent) => agent.name === name);
+  }
+
   // ════════════════════════════════════════════
   //  4. LAVRA_SUBAGENT TOOL
   //     (replaces SubagentStop hook — agents prompted to log learnings)
@@ -968,7 +1242,7 @@ export default function (pi: ExtensionAPI) {
 
       // ── Single agent mode ──
       if (params.agent && params.task) {
-        const agent = agents.find((a) => a.name === params.agent);
+        const agent = resolveAgent(params.agent);
         if (!agent) {
           return {
             content: [{ type: "text", text: `Unknown agent "${params.agent}". Available: ${agents.map((a) => a.name).join(", ")}` }],
@@ -995,7 +1269,7 @@ export default function (pi: ExtensionAPI) {
       if (params.agents && params.agents.length > 0) {
         const results = await Promise.all(
           params.agents.map(async (a) => {
-            const agent = agents.find((ag) => ag.name === a.agent);
+            const agent = resolveAgent(a.agent);
             if (!agent) return `## ${a.agent}: unknown agent`;
             const r = await runAgent(agent, a.task, ctx.cwd, ctx.signal);
             return `## ${a.agent}\n\n${r.output || r.error || "(no output)"}`;
@@ -1012,7 +1286,7 @@ export default function (pi: ExtensionAPI) {
         const outputs: string[] = [];
         for (let i = 0; i < params.chain.length; i++) {
           const step = params.chain[i];
-          const agent = agents.find((a) => a.name === step.agent);
+          const agent = resolveAgent(step.agent);
           if (!agent) {
             outputs.push(`Step ${i + 1} (${step.agent}): unknown agent`);
             break;

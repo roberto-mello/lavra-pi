@@ -11,16 +11,26 @@
   "repository": "https://github.com/roberto-mello/lavra-pi",
   "homepage": "https://lavra.dev",
   "pi": {
-    "extensions": ["./src/bridge.ts"],
+    "extensions": [
+      "./src/bridge.ts",
+      "./node_modules/pi-ask-user/index.ts"
+    ],
     "skills": [
       "./node_modules/@lavralabs/lavra/plugins/lavra/skills",
       "!./node_modules/@lavralabs/lavra/plugins/lavra/skills/agent-browser",
-      "!./node_modules/@lavralabs/lavra/plugins/lavra/skills/optional/frontend-design"
+      "!./node_modules/@lavralabs/lavra/plugins/lavra/skills/optional/frontend-design",
+      "./node_modules/pi-ask-user/skills"
     ]
   },
   "dependencies": {
-    "@lavralabs/lavra": "^0.7.6"
+    "@lavralabs/lavra": "^0.7.6",
+    "@sinclair/typebox": "^0.34.0",
+    "pi-ask-user": "0.13.0"
   },
+  "bundledDependencies": [
+    "@sinclair/typebox",
+    "pi-ask-user"
+  ],
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-ai": "*",

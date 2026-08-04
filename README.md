@@ -28,17 +28,25 @@ The extension discovers agents from there at startup.
 | **FTS5 knowledge search** | SQLite FTS5 with BM25 ranking (same algorithm as `knowledge-db.sh`) |
 | **Web search** | `web_search` tool — Brave API or agent-browser fallback |
 | **Framework docs** (Context7) | `framework_docs` tool — direct `fetch()`, no MCP server |
-| **Subagents** | Custom `lavra_subagent` tool — single/parallel/chain modes |
+| **Subagents** | Custom `lavra_subagent` tool — single/parallel/chain modes; Claude `Task(...)` is translated to it |
+| **User questions** | Bundled `pi-ask-user` package provides the `ask_user` tool for `AskUserQuestion` workflows |
 | **Subagent wrapup** (log learnings before exit) | Built into subagent tool — prompts `LEARNED:`/`DECISION:` comments |
 | **Model routing per agent** | Agent `model:` frontmatter → `--model` flag to subagent pi process |
 
-### Skill Conflicts
+### Skill Dispatch and Conflicts
 
-Skills bundled in `@lavralabs/lavra` are **not registered with pi**, so there
-are no collisions with skills you already have installed
-(agent-browser, frontend-design, brainstorming, etc.). Lavra's research agents
-discover and read skills directly from the filesystem during research,
-independent of pi's skill loading.
+Lavra skills are registered with Pi and use Pi's native syntax:
+
+```text
+/skill:lavra-work-single medsimples-lj5z
+```
+
+The bridge routes direct skill commands through `/skill:name`. Nested Claude
+`Skill(...)` references are translated to the compatibility `lavra_skill` tool
+because a model cannot invoke a slash command from inside another prompt.
+
+Duplicate copies are excluded for `agent-browser` and `frontend-design`, so
+user-installed versions win without collision warnings.
 
 ## Architecture
 
@@ -89,6 +97,9 @@ Claude Code Hook     →  pi Extension Event
 ─────────────────────────────────────────────────
 SessionStart         →  session_start
 PostToolUse (Bash)   →  tool_result (on bash tool)
+Skill(...)            →  native /skill:name; nested refs → lavra_skill
+Task(...)             →  lavra_subagent
+AskUserQuestion      →  ask_user (bundled pi-ask-user)
 SubagentStop         →  built into lavra_subagent tool lifecycle
 TeammateIdle         →  /lavra-ready command
 .mcp.json (Context7) →  framework_docs tool (HTTP fetch)
