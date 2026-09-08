@@ -23,7 +23,6 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
-  CustomEditor,
   type ExtensionAPI,
   type ExtensionContext,
   isToolCallEventType,
@@ -37,9 +36,15 @@ import { Type } from "typebox";
 
 /** Resolve the lavra package root inside node_modules */
 function lavraPackageRoot(): string {
-  // When pi installs a git package and runs npm install, @lavralabs/lavra
-  // ends up in node_modules/@lavralabs/lavra/ relative to this package root.
+  // Prefer a checked-out Lavra source tree for local development. Set
+  // LAVRA_SOURCE_DIR to override the conventional ~/Documents/projects/lavra
+  // location; installed npm packages remain the fallback for other machines.
+  const localSource = process.env.LAVRA_SOURCE_DIR?.trim();
   const candidates = [
+    ...(localSource ? [path.resolve(localSource)] : []),
+    path.join(os.homedir(), "Documents/projects/lavra"),
+    // When pi installs a git package and runs npm install, @lavralabs/lavra
+    // ends up in node_modules/@lavralabs/lavra/ relative to this package root.
     path.resolve(__dirname, "../node_modules/@lavralabs/lavra"),
     path.resolve(__dirname, "../../@lavralabs/lavra"),
     // When running via pi -e for local dev, the package might be resolved differently
@@ -116,28 +121,53 @@ interface KnowledgeEntry {
 }
 
 interface LavraModelConfig {
+  fast?: string;
+  default?: string;
+  quality?: string;
+  // Claude-era aliases retained for existing agent definitions/configs.
   haiku?: string;
   sonnet?: string;
+  opus?: string;
 }
 
-const MODEL_CONFIG_RELATIVE = ".lavra/config/pi-models.json";
+const LAVRA_CONFIG_RELATIVE = ".lavra/config/lavra.json";
+const MAX_AGENT_OUTPUT_CHARS = 24_000;
 
-function modelConfigPath(projectRoot: string): string {
-  return path.join(projectRoot, MODEL_CONFIG_RELATIVE);
+function lavraConfigPath(projectRoot: string): string {
+  return path.join(projectRoot, LAVRA_CONFIG_RELATIVE);
 }
 
-function readModelConfig(projectRoot: string): LavraModelConfig {
+function readLavraConfig(projectRoot: string): Record<string, any> {
   try {
-    return JSON.parse(fs.readFileSync(modelConfigPath(projectRoot), "utf-8"));
+    const config = JSON.parse(fs.readFileSync(lavraConfigPath(projectRoot), "utf-8"));
+    return config && typeof config === "object" && !Array.isArray(config) ? config : {};
   } catch {
     return {};
   }
 }
 
-function writeModelConfig(projectRoot: string, config: LavraModelConfig): void {
-  const file = modelConfigPath(projectRoot);
+function readModelConfig(projectRoot: string): LavraModelConfig {
+  const models = readLavraConfig(projectRoot).models;
+  return models && typeof models === "object" && !Array.isArray(models) ? models : {};
+}
+
+function writeModelConfig(projectRoot: string, models: LavraModelConfig): void {
+  const file = lavraConfigPath(projectRoot);
+  const config = readLavraConfig(projectRoot);
+  config.models = models;
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(config, null, 2) + "\n", "utf-8");
+}
+
+function maxParallelAgents(projectRoot: string): number {
+  const value = readLavraConfig(projectRoot)?.execution?.max_parallel_agents;
+  return Number.isInteger(value) && value > 0 ? value : 3;
+}
+
+function boundedAgentOutput(output: string): string {
+  return output.length <= MAX_AGENT_OUTPUT_CHARS
+    ? output
+    : output.slice(0, MAX_AGENT_OUTPUT_CHARS) + "\n\n[Subagent output truncated by lavra-pi.]";
 }
 
 // ═══════════════════════════════════════════════════
@@ -522,8 +552,14 @@ function availableSkillDirectories(cwd: string): string[] {
   const projectRoot = findProjectRoot(cwd);
   const roots = [cwd, projectRoot, os.homedir()];
   const suffixes = [".pi/skills", ".agents/skills", ".claude/skills", ".codex/skills"];
-  return [...new Set(roots.flatMap((root) => suffixes.map((suffix) => path.join(root, suffix))))]
-    .filter((dir) => fs.existsSync(dir));
+  const localSourceSkills = [
+    path.join(lavraPluginsPath(), "skills"),
+    path.join(lavraPackageRoot(), "plugins/lavra/codex/skills"),
+  ];
+  return [...new Set([
+    ...localSourceSkills,
+    ...roots.flatMap((root) => suffixes.map((suffix) => path.join(root, suffix))),
+  ])].filter((dir) => fs.existsSync(dir));
 }
 
 async function runAgent(
@@ -535,20 +571,31 @@ async function runAgent(
   onTranscript?: (event: SubagentTranscriptEvent) => void,
   modelOverride?: string,
 ): Promise<{ output: string; error?: string; usage: any }> {
-  const args: string[] = ["--mode", "json", "-p", "--no-session"];
+  // Children must be real one-shot workers: no inherited project instructions,
+  // no high global thinking default, and no second "continue" turn.
+  const args: string[] = [
+    "--mode", "json", "-p", "--no-session",
+    "--no-context-files",
+    "--exclude-tools", "lavra_subagent",
+    "--thinking", "medium",
+  ];
   for (const skillsDir of availableSkillDirectories(cwd)) args.push("--skill", skillsDir);
   if (modelOverride) args.push("--model", modelOverride);
-  if (agent.tools && agent.tools.length > 0) {
-    args.push("--tools", agent.tools.join(","));
-  }
+  const defaultTools = agent.category === "review"
+    ? ["read", "bash", "grep", "find", "ls"]
+    : agent.category === "research"
+      ? ["read", "bash", "grep", "find", "ls", "lavra_web_search", "web_search", "framework_docs", "knowledge_search"]
+      : ["read", "bash", "edit", "write", "grep", "find", "ls"];
+  args.push("--tools", (agent.tools?.length ? agent.tools : defaultTools).join(","));
 
   const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "lavra-agent-"));
   const promptFile = path.join(tmpDir, "prompt.md");
   try {
     const fullPrompt = `${agent.systemPrompt}\n\nTask: ${task}`;
     await fs.promises.writeFile(promptFile, fullPrompt, { encoding: "utf-8", mode: 0o600 });
-    args.push(promptFile);
-    args.push("(continue)");
+    // Pi reads files only through the @file syntax. Passing the path bare
+    // makes the child prompt be the filename rather than fullPrompt.
+    args.push(`@${promptFile}`);
   } catch {
     // fallback: pass task inline
     args.push(`Task: ${task}`);
@@ -558,6 +605,9 @@ async function runAgent(
     const proc = spawn("pi", args, {
       cwd,
       shell: false,
+      // Mark children so the bridge can disable recursive lavra_subagent
+      // registration while retaining the useful search/documentation tools.
+      env: { ...process.env, LAVRA_PI_SUBAGENT: "1" },
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -713,44 +763,6 @@ class SubagentSessionViewer {
   }
 }
 
-class SubagentChordEditor extends CustomEditor {
-  private pendingCtrlX: string | undefined;
-  private pendingTimer: ReturnType<typeof setTimeout> | undefined;
-
-  constructor(tui: any, theme: any, keybindings: any, private readonly onSubagentViewer: () => void) {
-    super(tui, theme, keybindings);
-  }
-
-  override handleInput(data: string): void {
-    if (this.pendingCtrlX !== undefined) {
-      if (matchesKey(data, Key.down)) {
-        this.clearPendingCtrlX();
-        this.onSubagentViewer();
-        return;
-      }
-      const previous = this.pendingCtrlX;
-      this.clearPendingCtrlX();
-      super.handleInput(previous);
-    }
-    if (matchesKey(data, Key.ctrl("x"))) {
-      this.pendingCtrlX = data;
-      this.pendingTimer = setTimeout(() => {
-        const pending = this.pendingCtrlX;
-        this.clearPendingCtrlX();
-        if (pending !== undefined) super.handleInput(pending);
-      }, 450);
-      return;
-    }
-    super.handleInput(data);
-  }
-
-  private clearPendingCtrlX(): void {
-    if (this.pendingTimer !== undefined) clearTimeout(this.pendingTimer);
-    this.pendingTimer = undefined;
-    this.pendingCtrlX = undefined;
-  }
-}
-
 // ═══════════════════════════════════════════════════
 // External API integrations
 // ═══════════════════════════════════════════════════
@@ -825,20 +837,29 @@ export default function (pi: ExtensionAPI) {
     return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
   }
 
-  function resolveAgentModel(agent: AgentDef, ctx: ExtensionContext): string | undefined {
-    const requested = (agent.model || "inherit").trim();
+  function resolveAgentModel(
+    agent: AgentDef,
+    ctx: ExtensionContext,
+    override?: string,
+  ): string | undefined {
+    const requested = (override || agent.model || "inherit").trim().toLowerCase();
     const current = activeModelId(ctx);
     if (!requested || requested === "inherit" || requested === "current") return current;
 
-    if (requested === "haiku" || requested === "sonnet") {
-      const configured = readModelConfig(findProjectRoot(ctx.cwd))[requested];
+    const tier = requested === "haiku" ? "fast"
+      : requested === "sonnet" || requested === "opus" ? "quality"
+        : requested === "fast" || requested === "default" || requested === "quality" ? requested
+          : undefined;
+    if (tier) {
+      const models = readModelConfig(findProjectRoot(ctx.cwd));
+      const configured = models[tier] || models[requested as keyof LavraModelConfig];
       return configured && configured !== "inherit" && configured !== "current"
         ? configured
         : current;
     }
 
     // Explicit Pi model IDs are passed through unchanged.
-    return requested.includes("/") ? requested : current;
+    return requested.includes("/") ? override || agent.model : current;
   }
 
   // Make project/user skills available to the main session and every child Pi.
@@ -853,7 +874,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     // Quick check: is this a Lavra project?
     if (!isLavraProject(ctx.cwd)) return;
-    if (ctx.mode === "tui") ctx.ui.setEditorComponent(subagentEditorFactory(ctx));
     const projectRoot = findProjectRoot(ctx.cwd);
 
     try {
@@ -938,16 +958,39 @@ export default function (pi: ExtensionAPI) {
   function skillFilePath(name: string, cwd?: string): string | null {
     // Skill names come from controlled skill metadata; reject path traversal.
     if (!/^[a-z0-9][a-z0-9-]*$/.test(name)) return null;
-    const roots = cwd ? [cwd, findProjectRoot(cwd)] : [];
+
+    const projectRoots = cwd ? [cwd, findProjectRoot(cwd)] : [];
     const dirs = [".pi/skills", ".agents/skills", ".claude/skills", ".codex/skills"];
-    for (const root of [...new Set(roots)]) {
+    for (const root of [...new Set(projectRoots)]) {
       for (const dir of dirs) {
         const file = path.join(root, dir, name, "SKILL.md");
         if (fs.existsSync(file)) return file;
       }
     }
-    const bundled = path.join(lavraPluginsPath(), "skills", name, "SKILL.md");
-    return fs.existsSync(bundled) ? bundled : null;
+
+    // Keep Pi aligned with the checked-out Lavra source before consulting
+    // copied harness skills or the installed npm snapshot.
+    const sourceFiles = [
+      path.join(lavraPluginsPath(), "skills", name, "SKILL.md"),
+      path.join(lavraPackageRoot(), "plugins/lavra/codex/skills", name, "SKILL.md"),
+      ...[os.homedir()].flatMap((root) => dirs.map((dir) => path.join(root, dir, name, "SKILL.md"))),
+    ];
+    return sourceFiles.find((file) => fs.existsSync(file)) ?? null;
+  }
+
+  function adaptLoadedSkill(name: string, content: string, cwd?: string, args = ""): string {
+    let adapted = content;
+    if (name === "lavra-review") {
+      // The upstream fallback scans every Lavra agent, including research
+      // agents. A work review should use review agents only unless the
+      // project explicitly configures a different review_agents list.
+      adapted = adapted.replace(
+        "**Config-missing behavior:** If `.lavra/config/project-setup.md` absent, dispatch all `DISCOVERED_AGENTS`.",
+        "**Config-missing behavior:** If `.lavra/config/project-setup.md` is absent, dispatch only the default review agents from `references/default-agents.md`. Never dispatch agents from research, design, docs, or workflow categories unless explicitly configured.",
+      );
+      adapted += "\n\n## Pi bridge review limit\nFor ordinary `/lavra-work` reviews, do not dispatch research agents. Research belongs to `/lavra-research` or the planning/design workflow.\n";
+    }
+    return adaptClaudeMessageText(adapted, cwd, args);
   }
 
   /**
@@ -1020,14 +1063,19 @@ export default function (pi: ExtensionAPI) {
     return output + content.slice(cursor);
   }
 
-  /** Dispatch a skill through Pi's native /skill:name expansion. */
+  /** Dispatch a skill, preferring the user's cross-harness copy when present. */
   function dispatchSkill(name: string, args: string, ctx: ExtensionContext): void {
-    if (!skillFilePath(name, ctx.cwd)) {
+    const file = skillFilePath(name, ctx.cwd);
+    if (!file) {
       ctx.ui.notify(`Lavra skill not found: ${name}`, "error");
       return;
     }
-    const suffix = args.trim() ? ` ${args.trim()}` : "";
-    pi.sendUserMessage(`/skill:${name}${suffix}`);
+
+    // Load the selected file directly instead of letting Pi resolve a stale
+    // package copy with the same skill name.
+    let content = fs.readFileSync(file, "utf-8");
+    content = content.replace(/\$ARGUMENTS|#\$ARGUMENTS/g, args || "");
+    pi.sendUserMessage(adaptLoadedSkill(name, content, ctx.cwd, args));
   }
 
   function chooseWorkSkill(args: string, cwd: string): "lavra-work-single" | "lavra-work-multi" {
@@ -1123,6 +1171,8 @@ export default function (pi: ExtensionAPI) {
         const parts = splitCallArguments(body);
         const namedAgent = body.match(/(?:subagent_type|agent)\s*=\s*(["']?)([a-z0-9][a-z0-9-]*)\1/i);
         const agent = namedAgent?.[2] || unquote(parts[0] || "general-purpose");
+        const namedModel = body.match(/model\s*=\s*(["']?)([a-z0-9][a-z0-9./:-]*)\1/i);
+        const model = namedModel?.[2];
         const namedPrompt = body.match(/prompt\s*=\s*(["'])([\s\S]*)\1\s*$/i);
         let task = namedPrompt?.[2] || "";
         if (!task) {
@@ -1134,7 +1184,7 @@ export default function (pi: ExtensionAPI) {
           }
         }
         if (!task) task = parts.slice(1).join(", ") || body;
-        output += `[Pi adaptation: call lavra_subagent with agent ${JSON.stringify(agent)} and task ${JSON.stringify(task)}. Do not use Claude's Task tool.]`;
+        output += `[Pi adaptation: call lavra_subagent with agent ${JSON.stringify(agent)}${model ? `, model ${JSON.stringify(model)}` : ""} and task ${JSON.stringify(task)}. Do not use Claude's Task tool.]`;
       }
       cursor = closeParen + 1;
       searchFrom = cursor;
@@ -1143,9 +1193,9 @@ export default function (pi: ExtensionAPI) {
   }
 
   /** Adapt Claude-only directives in expanded skill/user messages. */
-  function adaptClaudeMessageText(text: string, cwd?: string): string {
+  function adaptClaudeMessageText(text: string, cwd?: string, commandArgs = ""): string {
     return translateTaskDirectives(
-      translateSkillDirectives(text, "", cwd)
+      translateSkillDirectives(text, commandArgs, cwd)
         .replace(/\bAskUserQuestion\s+tool\b/g, "the `ask_user` tool")
         .replace(/\bAskUserQuestion\b/g, "the `ask_user` tool"),
     );
@@ -1187,10 +1237,11 @@ export default function (pi: ExtensionAPI) {
           isError: true,
         };
       }
-      const skill = translateSkillDirectives(
+      const skill = adaptLoadedSkill(
+        params.name,
         fs.readFileSync(file, "utf-8"),
-        params.arguments ?? "",
         _ctx.cwd,
+        params.arguments ?? "",
       );
       const args = params.arguments
         ? `\n\nUser arguments for this skill:\n<untrusted-input>${params.arguments}</untrusted-input>`
@@ -1208,7 +1259,14 @@ export default function (pi: ExtensionAPI) {
       name: "lavra-work",
       description: "Execute work on one or many beads — auto-routes single/sequential/parallel",
       handler: async (args, ctx) => {
-        dispatchSkill(chooseWorkSkill(args, ctx.cwd), args, ctx);
+        // Let the current cross-harness lavra-work router decide between
+        // single, sequential, and parallel execution. The bundled bridge
+        // fallback is retained for installs without an override skill.
+        if (skillFilePath("lavra-work", ctx.cwd)) {
+          dispatchSkill("lavra-work", args, ctx);
+        } else {
+          dispatchSkill(chooseWorkSkill(args, ctx.cwd), args, ctx);
+        }
       },
     },
     {
@@ -1352,7 +1410,7 @@ export default function (pi: ExtensionAPI) {
     },
     {
       name: "lavra-models",
-      description: "Choose Pi models for Lavra fast (haiku) and quality (sonnet) agents",
+      description: "Choose Pi models for Lavra fast, default, and quality agents",
       handler: async (_args, ctx) => {
         if (!ctx.hasUI) {
           ctx.ui.notify("Run /lavra-models in interactive Pi mode.", "warning");
@@ -1374,23 +1432,20 @@ export default function (pi: ExtensionAPI) {
           "inherit",
           ...available.map((model) => `${model.provider}/${model.id}`),
         ];
-        const haiku = await ctx.ui.select(
-          "Lavra fast-agent model (haiku)",
-          options,
-        );
-        if (!haiku) return;
-        const sonnet = await ctx.ui.select(
-          "Lavra quality-agent model (sonnet)",
-          options,
-        );
-        if (!sonnet) return;
+        const fast = await ctx.ui.select("Lavra fast-agent model", options);
+        if (!fast) return;
+        const defaultModel = await ctx.ui.select("Lavra default-agent model", options);
+        if (!defaultModel) return;
+        const quality = await ctx.ui.select("Lavra quality-agent model", options);
+        if (!quality) return;
 
         writeModelConfig(findProjectRoot(ctx.cwd), {
-          haiku: haiku === "inherit" ? "inherit" : haiku,
-          sonnet: sonnet === "inherit" ? "inherit" : sonnet,
+          fast: fast === "inherit" ? "inherit" : fast,
+          default: defaultModel === "inherit" ? "inherit" : defaultModel,
+          quality: quality === "inherit" ? "inherit" : quality,
         });
         ctx.ui.notify(
-          `Lavra models saved: haiku=${haiku}, sonnet=${sonnet}`,
+          `Lavra models saved: fast=${fast}, default=${defaultModel}, quality=${quality}`,
           "success",
         );
       },
@@ -1529,8 +1584,9 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  // Use Ctrl-Down so Pi's native Ctrl-X copy binding remains untouched.
   pi.registerShortcut(Key.ctrl("down"), {
-    description: "Review subagent sessions (Ctrl-X, Down also works)",
+    description: "Review subagent sessions",
     handler: (ctx) => openSubagentViewer(ctx),
   });
 
@@ -1541,8 +1597,9 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     signal: AbortSignal | undefined,
     progress: SubagentProgressSink | undefined,
+    modelOverride?: string,
   ) {
-    const model = resolveAgentModel(agent, ctx);
+    const model = resolveAgentModel(agent, ctx, modelOverride);
     const session = progress?.start(label, task);
     if (session) progress.update(session, `starting (${model ?? "default model"})`);
     const result = await runAgent(
@@ -1555,17 +1612,12 @@ export default function (pi: ExtensionAPI) {
     return result;
   }
 
-  function subagentEditorFactory(ctx: ExtensionContext) {
-    return (tui: any, theme: any, keybindings: any) =>
-      new SubagentChordEditor(tui, theme, keybindings, () => { void openSubagentViewer(ctx); });
-  }
-
   // ════════════════════════════════════════════
   //  4. LAVRA_SUBAGENT TOOL
   //     (replaces SubagentStop hook — agents prompted to log learnings)
   // ════════════════════════════════════════════
 
-  pi.registerTool({
+  if (process.env.LAVRA_PI_SUBAGENT !== "1") pi.registerTool({
     name: "lavra_subagent",
     label: "Lavra Subagent",
     description:
@@ -1576,10 +1628,13 @@ export default function (pi: ExtensionAPI) {
       "Agents are loaded from @lavralabs/lavra npm package at " + AGENTS_DIR,
     parameters: Type.Object({
       agent: Type.Optional(Type.String({ description: "Agent name (e.g. security-sentinel, best-practices-researcher)" })),
+      model: Type.Optional(Type.String({ description: "Model tier (fast, default, quality) or provider/model override" })),
       task: Type.Optional(Type.String({ description: "Task for the agent" })),
+
       agents: Type.Optional(Type.Array(
         Type.Object({
           agent: Type.String(),
+          model: Type.Optional(Type.String()),
           task: Type.String(),
         }),
         { description: "Parallel tasks (max 6)" },
@@ -1587,6 +1642,7 @@ export default function (pi: ExtensionAPI) {
       chain: Type.Optional(Type.Array(
         Type.Object({
           agent: Type.String(),
+          model: Type.Optional(Type.String()),
           task: Type.String(),
         }),
         { description: "Sequential steps. Use {previous} in task to reference prior output." },
@@ -1636,30 +1692,42 @@ export default function (pi: ExtensionAPI) {
           ctx,
           runSignal,
           progress,
+          params.model,
         );
         return {
-          content: [{ type: "text", text: result.output || result.error || "(no output)" }],
+          content: [{ type: "text", text: result.error || boundedAgentOutput(result.output || "(no output)") }],
           isError: !!result.error,
         };
       }
 
       // ── Parallel mode ──
       if (params.agents && params.agents.length > 0) {
-        const results = await Promise.all(
-          params.agents.map(async (a) => {
-            const agent = resolveAgent(a.agent);
-            if (!agent) return `## ${a.agent}: unknown agent`;
+        const results = new Array<string>(params.agents.length);
+        let next = 0;
+        const worker = async () => {
+          while (true) {
+            const index = next++;
+            if (index >= params.agents!.length) return;
+            const task = params.agents![index];
+            const agent = resolveAgent(task.agent);
+            if (!agent) {
+              results[index] = `## ${task.agent}: unknown agent`;
+              continue;
+            }
             const r = await runTrackedAgent(
               agent,
-              a.task,
-              `${a.agent} #${params.agents!.indexOf(a) + 1}`,
+              task.task,
+              `${task.agent} #${index + 1}`,
               ctx,
               runSignal,
               progress,
+              task.model,
             );
-            return `## ${a.agent}\n\n${r.output || r.error || "(no output)"}`;
-          }),
-        );
+            results[index] = `## ${task.agent}\n\n${r.error || boundedAgentOutput(r.output || "(no output)")}`;
+          }
+        };
+        const workers = Math.min(maxParallelAgents(findProjectRoot(ctx.cwd)), params.agents.length);
+        await Promise.all(Array.from({ length: workers }, () => worker()));
         return {
           content: [{ type: "text", text: results.join("\n\n---\n\n") }],
         };
@@ -1684,16 +1752,17 @@ export default function (pi: ExtensionAPI) {
             ctx,
             runSignal,
             progress,
+            step.model,
           );
           if (result.error) {
             outputs.push(`Step ${i + 1} (${step.agent}) failed: ${result.error}`);
             break;
           }
-          previous = result.output;
-          outputs.push(`## Step ${i + 1}: ${step.agent}\n\n${result.output}`);
+          previous = boundedAgentOutput(result.output);
+          outputs.push(`## Step ${i + 1}: ${step.agent}\n\n${boundedAgentOutput(result.output)}`);
         }
         return {
-          content: [{ type: "text", text: outputs.join("\n\n---\n\n") }],
+          content: [{ type: "text", text: boundedAgentOutput(outputs.join("\n\n---\n\n")) }],
         };
       }
 
@@ -1710,8 +1779,10 @@ export default function (pi: ExtensionAPI) {
   // ════════════════════════════════════════════
 
   pi.registerTool({
-    name: "web_search",
-    label: "Web Search",
+    // Keep Lavra's fallback search tool namespaced so it can coexist with
+    // pi-web-access, which owns the standard `web_search` name.
+    name: "lavra_web_search",
+    label: "Lavra Web Search",
     description: "Search the web for documentation, best practices, and references. " +
       "Uses Brave Search API (BRAVE_API_KEY env var). " +
       "Research agents use this to find current best practices.",

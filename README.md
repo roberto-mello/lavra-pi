@@ -12,9 +12,11 @@ pi install git:github.com/roberto-mello/lavra-pi
 **One command. Zero bootstrap. Everything auto-loads.**
 
 The bridge extension resolves agents from `@lavralabs/lavra` (the same npm
-package you already publish on `npmjs.com`). When pi runs `npm install`
+package you already publish on `npmjs.com`). For local development it first
+uses `LAVRA_SOURCE_DIR`, then `~/Documents/projects/lavra` when that checkout
+exists; the installed npm package is the fallback. When pi runs `npm install`
 during the git install, it pulls `@lavralabs/lavra` into `node_modules/`.
-The extension discovers agents from there at startup.
+The extension discovers agents from the selected source at startup.
 
 ## What You Get
 
@@ -26,14 +28,14 @@ The extension discovers agents from there at startup.
 | **Auto-recall** (session start knowledge injection) | `session_start` event handler reads knowledge.jsonl + session state |
 | **Memory capture** (post-tool knowledge extraction) | `tool_result` event intercepts `bd comments add` |
 | **FTS5 knowledge search** | SQLite FTS5 with BM25 ranking (same algorithm as `knowledge-db.sh`) |
-| **Web search** | `web_search` tool — Brave API or agent-browser fallback |
+| **Web search** | `lavra_web_search` fallback tool — Brave API or agent-browser fallback (the standard `web_search` tool is provided by pi-web-access) |
 | **Framework docs** (Context7) | `framework_docs` tool — direct `fetch()`, no MCP server |
 | **Subagents** | Custom `lavra_subagent` tool — single/parallel/chain modes; Claude `Task(...)` is translated to it |
-| **Subagent sessions** | On-demand live transcript viewer; `Ctrl-X`, `↓` opens it, `←/→` switches agents, `↑` returns to the main session |
+| **Subagent sessions** | On-demand live transcript viewer; `Ctrl-↓` opens it, `←/→` switches agents, `↑` returns to the main session |
 | **User questions** | Bundled `pi-ask-user` package provides the `ask_user` tool for `AskUserQuestion` workflows |
 | **Subagent wrapup** (log learnings before exit) | Built into subagent tool — prompts `LEARNED:`/`DECISION:` comments |
-| **Model routing per agent** | `haiku`/`sonnet`/`inherit` labels resolve to configured Pi models |
-| **Model setup** | `/lavra-models` queries Pi's available models and saves `.lavra/config/pi-models.json` |
+| **Model routing per agent** | `fast`/`default`/`quality`/`inherit` labels resolve to configured Pi models |
+| **Model setup** | `/lavra-models` queries Pi's available models and saves `.lavra/config/lavra.json` under `models` |
 
 ### Skill Dispatch and Conflicts
 
@@ -48,7 +50,9 @@ The bridge routes direct skill commands through `/skill:name`. Nested Claude
 because a model cannot invoke a slash command from inside another prompt.
 
 Duplicate copies are excluded for `agent-browser` and `frontend-design`, so
-user-installed versions win without collision warnings.
+user-installed versions win without collision warnings. For Lavra workflows,
+Pi prefers a user/project skill copy when available, so `/lavra-work` keeps the
+same sequential-vs-parallel prompt and defaults as the other harnesses.
 
 ## Architecture
 
@@ -97,15 +101,19 @@ Requires `sqlite3` CLI (already required by Lavra).
 Lavra agent frontmatter uses logical tiers rather than provider-specific IDs:
 
 ```yaml
-model: haiku   # fast/cheap
-model: sonnet  # quality
-model: inherit # current parent model
+model: fast     # low-cost/fast
+model: default  # normal quality
+model: quality  # highest quality
+model: inherit  # current parent model
 ```
 
-Run `/lavra-models` in an interactive session to choose the Pi model for
-`haiku` and `sonnet` agents. The choices are saved per project in
-`.lavra/config/pi-models.json`. Explicit `provider/model` values are also
-passed through unchanged.
+After installation, run `/lavra-models` once in each Lavra project to choose
+models for `fast`, `default`, and `quality` agents. Choices are saved per project in
+`.lavra/config/lavra.json` under `models`; installation stays non-interactive and does not
+make model or credential assumptions. The tiers are provider-neutral: `fast`,
+`default`, and `quality`; old `haiku`/`sonnet`/`opus` agent labels remain
+compatible. Until configured, children inherit the current model at medium
+thinking. Explicit `provider/model` values are also passed through unchanged.
 
 ## Hook Replacement Map
 
