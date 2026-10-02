@@ -22,11 +22,9 @@
   },
   "dependencies": {
     "@lavralabs/lavra": "^0.7.6",
-    "@sinclair/typebox": "^0.34.0",
     "pi-ask-user": "0.13.0"
   },
   "bundledDependencies": [
-    "@sinclair/typebox",
     "pi-ask-user"
   ],
   "peerDependencies": {
