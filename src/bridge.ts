@@ -1584,8 +1584,8 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // Use Ctrl-Down so Pi's native Ctrl-X copy binding remains untouched.
-  pi.registerShortcut(Key.ctrl("down"), {
+  // Ctrl-Shift-R avoids Pi's native prompt-navigation bindings.
+  pi.registerShortcut(Key.ctrlShift("r"), {
     description: "Review subagent sessions",
     handler: (ctx) => openSubagentViewer(ctx),
   });
